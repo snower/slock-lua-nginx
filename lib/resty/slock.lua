@@ -11,6 +11,7 @@ local tonumber = tonumber
 local tostring = tostring
 local rawget = rawget
 local select = select
+local semaphore = require "ngx.semaphore"
 
 local ok, new_tab = pcall(require, "table.new")
 if not ok or type(new_tab) ~= "function" then
@@ -19,12 +20,14 @@ end
 
 local _M = new_tab(0, 55)
 local _MetaM = { __index = _M }
+local _clients = {}
 
 _M._VERSION = '0.0.1'
 
 local MAGIC = 0x56
 local VERSION = 0x01
 
+local COMMAND_TYPE_INIT = 0
 local COMMAND_TYPE_LOCK = 1
 local COMMAND_TYPE_UNLOCK = 2
 
@@ -219,9 +222,9 @@ function Lock.acquire(self)
         rcount = self._reentrant_count,
     })
     if result == nil then
-        return -1, nil
+        return nil, err
     end
-    return 0
+    return result
 end
 
 function Lock.release(self)
@@ -238,9 +241,9 @@ function Lock.release(self)
         rcount = self._reentrant_count,
     })
     if result == nil then
-        return -1, err
+        return nil, err
     end
-    return 0
+    return result
 end
 
 local DataBase = new_tab(0, 55)
@@ -253,21 +256,27 @@ function DataBase.new(self, client, db_id)
     }, _MetaDataBase)
 end
 
-function DataBase.Lock(self, lock_key, timeout, expried, lock_id, max_count, reentrant_count)
+function DataBase.newLock(self, lock_key, timeout, expried, lock_id, max_count, reentrant_count)
     return Lock:new(self, lock_key, timeout, expried, lock_id, max_count, reentrant_count)
 end
 
 local Client = new_tab(0, 55)
 local _MetaClient = { __index = Client }
 
-function Client.new(self, host, port) 
+function Client.new(self, name, host, port) 
     return setmetatable({ 
+        _name = name,
         _host = host, 
         _port = port, 
         _sock = nil,
+        _client_id = gen_lock_id(),
         _dbs = {},
-        _waiters = {},
-        _requests = {}
+        _commands_waiter = semaphore.new(),
+        _commands_head = nil,
+        _commands_tail = nil,
+        _results_waiter = {},
+        _results = {},
+        _closed = false
     }, _MetaClient)
 end
 
@@ -276,16 +285,80 @@ function Client.connect(self)
     if not sock then
         return false, err
     end
+    sock:settimeouts(5000, 60000, 15000)
 
-    ok, err = sock:connect(self._host, self._port)
+    local ok, err = sock:connect(self._host, self._port)
     if not ok then
         return false, err
     end
     
     self._sock = sock
-    self._sock:settimeouts(5, 60, 60)
-    self._sock:setkeepalive(7200)
+    local err = self:init()
+    if err ~= nil then
+        sock:close()
+        self._sock = nil
+        return false, err
+    end
     return true
+end
+
+function Client.reconnect(self)
+    self._sock = nil
+    while true
+    do
+        ngx.sleep(3)
+        if self._closed then
+            return
+        end
+        local ok, err = self:connect()
+        if ok then
+            return
+        end
+    end
+end
+
+function Client.close(self) 
+    _clients[self._name] = nil
+    self._closed = true
+end
+
+function Client.init(self) 
+    data = string.char(MAGIC) .. string.char(VERSION) .. string.char(COMMAND_TYPE_INIT) .. gen_request_id() .. self._client_id
+    for i=0,28,1 do
+        data = data .. string.char(0)
+    end
+
+    local n, err = self._sock:send(data)
+    if n == nil then
+        if err == 'closed' then
+            self:close()
+        end
+        return err
+    end
+
+    local data, err = self._sock:receive(64)
+    if data == nil then
+        return err
+    end
+
+    if #data ~= 64 then
+        return 'data len error'
+    end
+
+    local result = {}
+    if string.byte(string.sub(data, 1, 1)) ~= MAGIC then
+        return 'magic error'
+    end
+
+    if string.byte(string.sub(data, 2, 2)) ~= VERSION then
+        return 'unknown version'
+    end
+    
+    local result = string.byte(string.sub(data, 20, 20))
+    if result ~= 0 then
+        return "result error code: " .. hex_encode(string.sub(data, 20, 20))
+    end
+    return nil
 end
 
 function Client.select(self, db_id)
@@ -296,9 +369,9 @@ function Client.select(self, db_id)
     return self._dbs[db_id]
 end
 
-function Client.Lock(self, lock_key, timeout, expried)
+function Client.newLock(self, lock_key, timeout, expried)
     local db = self:select(0)
-    return db:Lock(lock_key, timeout, expried, '', 0, 0)
+    return db:newLock(lock_key, timeout, expried, '', 0, 0)
 end
 
 function Client.readCommand(self)
@@ -326,20 +399,21 @@ function Client.readCommand(self)
     
     result.command = string.byte(string.sub(data, 3, 3))
     result.request_id = string.sub(data, 4, 19)
-    result.flag = string.byte(string.sub(data, 20, 20))
-    result.db_id = string.byte(string.sub(data, 21, 21))
-    result.lock_id = string.sub(data, 22, 37)
-    result.lock_key = string.sub(data, 38, 53)
-    result.lcount = bin_to_uint16(string.sub(data, 54, 55))
-    result.count = bin_to_uint16(string.sub(data, 56, 57))
-    result.lrcount = string.byte(string.sub(data, 58, 58))
-    result.rcount = string.byte(string.sub(data, 59, 59))
+    result.result = string.byte(string.sub(data, 20, 20))
+    result.flag = string.byte(string.sub(data, 21, 21))
+    result.db_id = string.byte(string.sub(data, 22, 22))
+    result.lock_id = string.sub(data, 23, 38)
+    result.lock_key = string.sub(data, 39, 54)
+    result.lcount = bin_to_uint16(string.sub(data, 55, 56))
+    result.count = bin_to_uint16(string.sub(data, 57, 58))
+    result.lrcount = string.byte(string.sub(data, 59, 59))
+    result.rcount = string.byte(string.sub(data, 60, 60))
     return result
 end
 
 function Client.writeCommand(self, command)
     if self._sock == nil then
-        return nil, 'sock unconnected'
+        return 0, 'sock unconnected'
     end
 
     data = string.char(MAGIC) .. string.char(VERSION) .. string.char(command.command) .. command.request_id .. string.char(command.flag or 0)
@@ -349,41 +423,149 @@ function Client.writeCommand(self, command)
 
     local n, err = self._sock:send(data)
     if n == nil then
-        return nil, err
+        return 0, err
     end
-    return command
+    return n
 end
 
 function Client.command(self, command)
-    command.request_id = gen_request_id()
-    local c, err = self:writeCommand(command)
-    if c == nil then
-        return nil, err
+    if self._sock == nil then
+        return nil, 'sock unconnected'
     end
 
-    local result, err = self:readCommand()
-    if result == nil then
-        return nil, err
+    command.request_id = gen_request_id()
+    local waiter = semaphore.new()
+    self._results_waiter[command.request_id] = waiter
+    if self._commands_head == nil then
+        self._commands_head = command
+        self._commands_tail = command
+    else
+        self._commands_tail._next = command
+        self._commands_tail = command
+    end
+    self._commands_waiter:post(1)
+    local result = nil
+    local ok, err = waiter:wait(command.timeout + 1)
+    if ok then
+        result = self._results[command.request_id]
+        if result ~= nil then
+            self._results[command.request_id] = nil
+        end
+    else
+        command._closed = true
+    end
+    if self._results_waiter[command.request_id] ~= nil then
+        self._results_waiter[command.request_id] = waiter
     end
     return result
 end
 
-function _M.connect(self, host, port)
-    if self._pools == nil then
-        self._pools = {}
+function Client.processRead(self)
+    while not self._closed 
+    do
+        local result, err = self:readCommand()
+        if result == nil then
+            if err ~= "timeout" then
+                ngx.log(ngx.ERR, "slock read command error: " .. err)
+            end
+
+            if err == "closed" then
+                if self._closed then
+                    self._commands_waiter:post(1)
+                    return
+                end
+                self:reconnect()
+            end
+        else
+            local waiter = self._results_waiter[result.request_id]
+            if waiter ~= nil then
+                self._results[result.request_id] = result
+                self._results_waiter[result.request_id] = nil
+                waiter:post(1)
+            end
+        end
     end
 
-    local key = host .. port
-    if self._pools[key] == nil then
-        local c = Client:new(host, port)
+    if self._sock ~= nil then
+        local ok, err = self._sock:close()
+        if not ok then
+            ngx.log(ngx.ERR, "slock close sockket error: " .. err)
+        end
+    end
+    self._commands_waiter:post(1)
+end
+
+function Client.processWrite(self)
+    while not self._closed
+    do
+        local ok, err =  self._commands_waiter:wait(60)
+        if not ok then
+            if err ~= "timeout" then
+                ngx.log(ngx.ERR, "slock wait command error: " .. err)
+            end
+        else
+            local command = self._commands_head
+            if command ~= nil then
+                self._commands_head = self._commands_head._next
+                if self._commands_head == nil then
+                    self._commands_tail = nil
+                end
+
+                if not command._closed then
+                    local n, err = self:writeCommand(command)
+                    if err ~= nil then
+                        ngx.log(ngx.ERR, "slock write command error: " .. err)
+                    end
+                end
+            end
+        end
+    end
+end
+
+function Client.processExiting(self)
+    while not self._closed
+    do
+        local exiting = ngx.worker.exiting()
+        if exiting then
+            self:close()
+            return
+        end
+        ngx.sleep(5)
+    end
+end
+
+function _M.connect(self, name, host, port)
+    local doConnect = function()
+        if _clients[name] ~= nil then
+            return nil, "name used"
+        end
+
+        local c = Client:new(name, host, port)
         local ok, err = c:connect()
         if not ok then
+            ngx.log(ngx.ERR, "connect error:" .. err)
             return nil, err
         end
-        self._pools[key] = c
-        return c
+        _clients[name] = c
+
+        local doProcessWrite = function()
+            c:processWrite()
+        end
+        local doProcessExiting = function()
+            c:processExiting()
+        end
+        ngx.thread.spawn(doProcessWrite)
+        ngx.thread.spawn(doProcessExiting)
+        c:processRead()
     end
-    return self._pools[key]
+    ngx.timer.at(0, doConnect)
+end
+
+function _M.get(self, name)
+    if _clients[name] == nil then
+        return nil
+    end
+    return _clients[name]
 end
 
 return _M
