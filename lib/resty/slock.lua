@@ -161,50 +161,34 @@ function gen_request_id()
     return uint32_to_bin(os.time()) .. uint32_to_bin(request_id_index) .. random_bytes(8)
 end
 
+function format_key(key)
+    if #key < 16 then
+        local padding = ''
+        for i = 1, 16 - #key do
+            padding = padding .. string.char(0)
+        end
+        return padding .. key
+    end
+
+    if #key == 32 then
+        local d, err = hex_decode(key)
+        if d ~= nil then
+            return d
+        end
+    end
+
+    return ngx.md5_bin(key)
+end
+
 local Lock = new_tab(0, 55)
 local _MetaLock = { __index = Lock }
 
 function Lock.new(self, db, lock_key, timeout, expried, lock_id, max_count, reentrant_count) 
-    if #lock_key < 16 then
-        local padding = ''
-        for i = 1, 16 - #lock_key do
-            padding = padding .. string.char(0)
-        end
-        lock_key = padding .. lock_key
-    else
-        if #lock_key == 32 then
-            local d, err = hex_decode(lock_key)
-            if d ~= nil then
-                lock_key = d
-            else
-                lock_key = ngx.md5_bin(lock_key)
-            end
-        else
-            lock_key = ngx.md5_bin(lock_key)
-        end
-    end
-
+    lock_key = format_key(lock_key)
     if lock_id == nil or #lock_id == 0 then
         lock_id = gen_lock_id()
     else
-        if #lock_id < 16 then
-            local padding = ''
-            for i = 1, 16 - #lock_id do
-                padding = padding .. string.char(0)
-            end
-            lock_id = padding .. lock_id
-        else 
-            if #lock_id == 32 then
-                local d, err = hex_decode(lock_id)
-                if d ~= nil then
-                    lock_id = d
-                else
-                    lock_id = ngx.md5_bin(lock_id)
-                end
-            else
-                lock_id = ngx.md5_bin(lock_id)
-            end
-        end
+        lock_id = format_key(lock_id)
     end
 
     if max_count ~= nil and max_count > 0 then
@@ -304,7 +288,7 @@ function Lock.show(self)
         return false, err
     end
 
-    if result.result ~= 7 then
+    if result.result ~= RESULT_UNOWN_ERROR then
         return false, "errcode:" .. result.result, result
     end
     return true, "", result
@@ -327,7 +311,7 @@ function Lock.update(self)
         return false, err
     end
 
-    if result.result ~= 0 and result.result ~= 5 then
+    if result.result ~= 0 and result.result ~= RESULT_LOCKED_ERROR then
         return false, "errcode:" .. result.result, result
     end
     return true, "", result
@@ -356,6 +340,139 @@ function Lock.releaseHead(self)
     return true, "", result
 end
 
+local Event = new_tab(0, 55)
+local _MetaEvent = { __index = Event }
+
+function Event.new(self, db, event_key, timeout, expried, default_seted) 
+    event_key = format_key(event_key)
+
+    return setmetatable({
+        _db = db,
+        _event_key = event_key,
+        _timeout = timeout or 0,
+        _expried = expried or 0,
+        _default_seted = default_seted or false,
+        _event_lock = nil,
+        _check_lock = nil,
+        _wait_lock = nil
+    }, _MetaEvent)
+end
+
+function Event.clear(self)
+    if self._default_seted then
+        if self._event_lock == nil then
+            self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 0, 0)
+        end
+
+        local ok, err, result = self._event_lock:update()
+        if ok then
+            return true, "", result
+        end
+        return false, err, result
+    end
+
+
+    if self._event_lock == nil then
+        self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 2, 0)
+    end
+
+    local ok, err, result = self._event_lock:release()
+    if ok then
+        return true, "", result
+    end
+    if result ~= nil and result.result == RESULT_UNLOCK_ERROR then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function Event.set(self)
+    if self._default_seted then
+        if self._event_lock == nil then
+            self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 0, 0)
+        end
+
+        local ok, err, result = self._event_lock:release()
+        if ok then
+            return true, "", result
+        end
+        if result ~= nil and result.result == RESULT_UNLOCK_ERROR then
+            return true, "", result
+        end
+        return false, err, result
+    end
+
+
+    if self._event_lock == nil then
+        self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 2, 0)
+    end
+
+    local ok, err, result = self._event_lock:update()
+    if ok then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function Event.isSet(self)
+    if self._default_seted then
+        self._event_lock = Lock:new(self._db, self._event_key, 0, 0, nil, 0, 0)
+        local ok, err, result = self._event_lock:acquire()
+        if ok then
+            return true, "", result
+        end
+        return false, err, result
+    end
+
+    self._event_lock = Lock:new(self._db, self._event_key, 0x02000000, 0, nil, 2, 0)
+    local ok, err, result = self._event_lock:acquire()
+    if ok then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function Event.wait(self, timeout)
+    if self._default_seted then
+        self._wait_lock = Lock:new(self._db, self._event_key, timeout, 0, nil, 0, 0)
+        local ok, err, result = self._wait_lock:acquire()
+        if ok then
+            return true, "", result
+        end
+        return false, err, result
+    end
+
+    self._wait_lock = Lock:new(self._db, self._event_key, timeout | 0x02000000, 0, nil, 2, 0)
+    local ok, err, result = self._wait_lock:acquire()
+    if ok then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function Event.waitAndTimeoutRetryClear(self, timeout)
+    if self._default_seted then
+        self._wait_lock = Lock:new(self._db, self._event_key, timeout, 0, nil, 0, 0)
+        local ok, err, result = self._wait_lock:acquire()
+        if ok then
+            return true, "", result
+        end
+
+        if result ~= nil and result.result == RESULT_TIMEOUT then
+            if self._event_lock == nil then
+                self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 0, 0)
+            end
+
+        local eok, eerr, eresult = self._event_lock.update()
+        if eok and eresult ~= nil and eresult.result == RESULT_SUCCED then
+            self._event_lock.releasetry()
+            return true, "", result
+        end
+        return false, err, result
+    end
+    return self:wait(timeout)
+end
+
 local DataBase = new_tab(0, 55)
 local _MetaDataBase = { __index = DataBase }
 
@@ -368,6 +485,14 @@ end
 
 function DataBase.newLock(self, lock_key, timeout, expried, lock_id, max_count, reentrant_count)
     return Lock:new(self, lock_key, timeout, expried, lock_id, max_count, reentrant_count)
+end
+
+function DataBase.newDefaultSetEvent(self, event_key, timeout, expried)
+    return Event:new(self, event_key, timeout, expried, true)
+end
+
+function DataBase.newDefaultClearEvent(self, event_key, timeout, expried, false)
+    return Event:new(self, event_key, timeout, expried, false)
 end
 
 local Client = new_tab(0, 55)
@@ -709,6 +834,16 @@ function Client.newLock(self, lock_key, timeout, expried)
     return db:newLock(lock_key, timeout, expried, '', 0, 0)
 end
 
+function Client.newDefaultSetEvent(self, event_key, timeout, expried)
+    local db = self:select(0)
+    return db:newDefaultSetEvent(event_key, timeout, expried)
+end
+
+function Client.newDefaultClearEvent(self, event_key, timeout, expried)
+    local db = self:select(0)
+    return db:newDefaultClearEvent(event_key, timeout, expried)
+end
+
 local ReplsetClient = new_tab(0, 55)
 local _MetaReplsetClient = { __index = ReplsetClient }
 
@@ -769,6 +904,22 @@ function ReplsetClient.newLock(self, lock_key, timeout, expried)
         return nil, "all client closed"
     end
     return client:newLock(lock_key, timeout, expried)
+end
+
+function ReplsetClient.newDefaultSetEvent(self, event_key, timeout, expried)
+    local client = self:getClient()
+    if client == nil then
+        return nil, "all client closed"
+    end
+    return client:newDefaultSetEvent(event_key, timeout, expried)
+end
+
+function ReplsetClient.newDefaultClearEvent(self, event_key, timeout, expried)
+    local client = self:getClient()
+    if client == nil then
+        return nil, "all client closed"
+    end
+    return client:newDefaultClearEvent(event_key, timeout, expried)
 end
 
 function _M.connect(self, name, host, port)
