@@ -442,7 +442,8 @@ function Event.wait(self, timeout)
         return false, err, result
     end
 
-    self._wait_lock = Lock:new(self._db, self._event_key, timeout | 0x02000000, 0, nil, 2, 0)
+    timeout = bit.bor(timeout, 0x02000000)
+    self._wait_lock = Lock:new(self._db, self._event_key, timeout, 0, nil, 2, 0)
     local ok, err, result = self._wait_lock:acquire()
     if ok then
         return true, "", result
@@ -463,10 +464,11 @@ function Event.waitAndTimeoutRetryClear(self, timeout)
                 self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 0, 0)
             end
 
-        local eok, eerr, eresult = self._event_lock.update()
-        if eok and eresult ~= nil and eresult.result == RESULT_SUCCED then
-            self._event_lock.releasetry()
-            return true, "", result
+            local eok, eerr, eresult = self._event_lock.update()
+            if eok and eresult ~= nil and eresult.result == RESULT_SUCCED then
+                self._event_lock.releasetry()
+                return true, "", result
+            end
         end
         return false, err, result
     end
@@ -482,7 +484,7 @@ function MaxConcurrentFlow.new(self, db, flow_key, count, timeout, expried, requ
         count = 0xffff
     end
     if expried < 30 and expried % 1 > 0 then
-        expried = math.floor(expried * 1000) | 0x04000000
+        expried = bit.bor(math.floor(expried * 1000), 0x04000000)
     else
         expried = math.floor(expried)
     end
@@ -504,7 +506,8 @@ end
 
 function MaxConcurrentFlow.acquire(self)
     if self._lock == nil then
-        self._lock = Lock:new(self._db, self._flow_key, self._timeout, self._expried | self._expried_flag, nil, self._count, 0)
+        local expried = bit.bor(self._expried, self._expried_flag)
+        self._lock = Lock:new(self._db, self._flow_key, self._timeout, expried, nil, self._count, 0)
     end
     return self._lock:acquire()
 end
@@ -541,10 +544,11 @@ end
 
 function TokenBucketFlow.acquire(self)
     ngx.update_time()
+    local timeout = bit.bor(self._timeout, 0x01000000)
     local expried = 0
     if self._period <= 1 then
         local now = ngx.now()
-        expried = math.floor(1000 - ((now % 1) * 1000)) | 0x04000000
+        expried = bit.bor(math.floor(1000 - ((now % 1) * 1000)), 0x04000000)
     else
         local now = ngx.time()
         if self._period % 60 == 0 then
@@ -553,10 +557,8 @@ function TokenBucketFlow.acquire(self)
             expried = self._period - (now % self._period)
         end
     end
-
-    if self._lock == nil then
-        self._lock = Lock:new(self._db, self._flow_key, self._timeout | 0x01000000, expried | self._expried_flag, nil, self._count, 0)
-    end
+    expried = bit.bor(expried, self._expried_flag)
+    self._lock = Lock:new(self._db, self._flow_key, timeout, expried, nil, self._count, 0)
     return self._lock:acquire()
 end
 
@@ -578,8 +580,16 @@ function DataBase.newDefaultSetEvent(self, event_key, timeout, expried)
     return Event:new(self, event_key, timeout, expried, true)
 end
 
-function DataBase.newDefaultClearEvent(self, event_key, timeout, expried, false)
+function DataBase.newDefaultClearEvent(self, event_key, timeout, expried)
     return Event:new(self, event_key, timeout, expried, false)
+end
+
+function DataBase.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
+    return MaxConcurrentFlow:new(self, flow_key, count, timeout, expried, require_aof)
+end
+
+function DataBase.newTokenBucketFlow(self, flow_key, count, timeout, period, require_aof)
+    return TokenBucketFlow:new(self, flow_key, count, timeout, period, require_aof)
 end
 
 local Client = new_tab(0, 55)
@@ -931,6 +941,16 @@ function Client.newDefaultClearEvent(self, event_key, timeout, expried)
     return db:newDefaultClearEvent(event_key, timeout, expried)
 end
 
+function Client.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
+    local db = self:select(0)
+    return db:newMaxConcurrentFlow(flow_key, count, timeout, expried, require_aof)
+end
+
+function Client.newTokenBucketFlow(self, flow_key, count, timeout, period, require_aof)
+    local db = self:select(0)
+    return db:newTokenBucketFlow(flow_key, count, timeout, period, require_aof)
+end
+
 local ReplsetClient = new_tab(0, 55)
 local _MetaReplsetClient = { __index = ReplsetClient }
 
@@ -1007,6 +1027,22 @@ function ReplsetClient.newDefaultClearEvent(self, event_key, timeout, expried)
         return nil, "all client closed"
     end
     return client:newDefaultClearEvent(event_key, timeout, expried)
+end
+
+function ReplsetClient.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
+    local client = self:getClient()
+    if client == nil then
+        return nil, "all client closed"
+    end
+    return client:newMaxConcurrentFlow(flow_key, count, timeout, expried, require_aof)
+end
+
+function ReplsetClient.newTokenBucketFlow(self, flow_key, count, timeout, period, require_aof)
+    local client = self:getClient()
+    if client == nil then
+        return nil, "all client closed"
+    end
+    return client:newTokenBucketFlow(flow_key, count, timeout, period, require_aof)
 end
 
 function _M.connect(self, name, host, port)
