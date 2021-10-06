@@ -473,6 +473,93 @@ function Event.waitAndTimeoutRetryClear(self, timeout)
     return self:wait(timeout)
 end
 
+local MaxConcurrentFlow = new_tab(0, 55)
+local _MetaMaxConcurrentFlow = { __index = MaxConcurrentFlow }
+
+function MaxConcurrentFlow.new(self, db, flow_key, count, timeout, expried, require_aof) 
+    flow_key = format_key(flow_key)
+    if count == nil or count >= 0xffff then
+        count = 0xffff
+    end
+    if expried < 30 and expried % 1 > 0 then
+        expried = math.floor(expried * 1000) | 0x04000000
+    else
+        expried = math.floor(expried)
+    end
+    local expried_flag = 0x02000000
+    if require_aof then
+        expried_flag = 0x01000000
+    end
+
+    return setmetatable({
+        _db = db,
+        _flow_key = flow_key,
+        _count = count or 0xffff,
+        _timeout = timeout or 5,
+        _expried = expried or 60,
+        _expried_flag = expried_flag,
+        _lock = nil
+    }, _MetaMaxConcurrentFlow)
+end
+
+function MaxConcurrentFlow.acquire(self)
+    if self._lock == nil then
+        self._lock = Lock:new(self._db, self._flow_key, self._timeout, self._expried | self._expried_flag, nil, self._count, 0)
+    end
+    return self._lock:acquire()
+end
+
+function MaxConcurrentFlow.release(self)
+    if self._lock == nil then
+        return false, "unacquire"
+    end
+    return self._lock:releasetry()
+end
+
+local TokenBucketFlow = new_tab(0, 55)
+local _MetaTokenBucketFlow = { __index = TokenBucketFlow }
+
+function TokenBucketFlow.new(self, db, flow_key, count, timeout, period, require_aof) 
+    flow_key = format_key(flow_key)
+    if count == nil or count >= 0xffff then
+        count = 0xffff
+    end
+    local expried_flag = 0x02000000
+    if require_aof then
+        expried_flag = 0x01000000
+    end
+
+    return setmetatable({
+        _db = db,
+        _flow_key = flow_key,
+        _timeout = timeout or 5,
+        _period = period or 60,
+        _expried_flag = expried_flag,
+        _lock = nil
+    }, _MetaTokenBucketFlow)
+end
+
+function TokenBucketFlow.acquire(self)
+    ngx.update_time()
+    local expried = 0
+    if self._period <= 1 then
+        local now = ngx.now()
+        expried = math.floor(1000 - ((now % 1) * 1000)) | 0x04000000
+    else
+        local now = ngx.time()
+        if self._period % 60 == 0 then
+            expried = ((math.floor(now / 60) + 1) * 60) % 120 + (60 - (now % 60))
+        else
+            expried = self._period - (now % self._period)
+        end
+    end
+
+    if self._lock == nil then
+        self._lock = Lock:new(self._db, self._flow_key, self._timeout | 0x01000000, expried | self._expried_flag, nil, self._count, 0)
+    end
+    return self._lock:acquire()
+end
+
 local DataBase = new_tab(0, 55)
 local _MetaDataBase = { __index = DataBase }
 
