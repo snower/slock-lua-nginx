@@ -559,7 +559,6 @@ end
 
 function TokenBucketFlow.acquire(self)
     ngx.update_time()
-    local timeout = bit.bor(self._timeout, 0x01000000)
     local expried = 0
     if self._period <= 1 then
         local now = ngx.now()
@@ -573,8 +572,12 @@ function TokenBucketFlow.acquire(self)
         end
     end
     expried = bit.bor(expried, self._expried_flag)
-    self._lock = Lock:new(self._db, self._flow_key, timeout, expried, nil, self._count, 0)
-    return self._lock:acquire()
+    self._lock = Lock:new(self._db, self._flow_key, 0, expried, nil, self._count, 0)
+    local ok, err, result = self._lock:acquire()
+    if not ok and result ~= nil and result.result == RESULT_TIMEOUT then
+        self._lock = Lock:new(self._db, self._flow_key, self._timeout, self._period, nil, self._count, 0)
+        return self._lock:acquire()
+    return ok, err, result
 end
 
 local DataBase = new_tab(0, 55)
