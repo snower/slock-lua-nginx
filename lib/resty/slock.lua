@@ -62,14 +62,14 @@ function hex_encode(s)
     local es = ''
     for i = 1, #s do
         local b = string.byte(string.sub(s, i, i))
-        local ub = math.modf(b / 16)
-        es = es .. ENCODE_HEXS[ub + 1] .. ENCODE_HEXS[math.fmod(b, 16) + 1]
+        local ub = math.floor(b / 16)
+        es = es .. ENCODE_HEXS[ub + 1] .. ENCODE_HEXS[(b % 16) + 1]
     end
     return es
 end
 
 function hex_decode(es)
-    if math.fmod(#es, 2) == 1 then
+    if (#es % 2) ~= 0 then
         return nil, 'hex string len error'
     end
 
@@ -91,12 +91,12 @@ function hex_decode(es)
 end
 
 function uint16_to_bin(i)
-    if i >= 0xffff or i < 0 then
+    if i > 0xffff or i < 0 then
         return nil, 'out max size'
     end
 
-    local ui = math.modf(i / 256)
-    return string.char(math.fmod(i, 256)) .. string.char(ui)
+    local ui = math.floor(i / 256)
+    return string.char(i % 256) .. string.char(ui)
 end
 
 function bin_to_uint16(b)
@@ -112,12 +112,12 @@ function uint32_to_bin(i)
         return nil, 'out max size'
     end
 
-    local lbit, msg = uint16_to_bin(math.fmod(i, 65536))
+    local lbit, msg = uint16_to_bin(i % 65536)
     if lbit == nil then
         return nil, msg
     end
 
-    local ui = math.modf(i / 65536)
+    local ui = math.floor(i / 65536)
     local ubit, msg = uint16_to_bin(ui)
     if ubit == nil then
         return nil, msg
@@ -162,6 +162,10 @@ function gen_request_id()
 end
 
 function format_key(key)
+    if #key == 16 then
+        return key
+    end
+
     if #key < 16 then
         local padding = ''
         for i = 1, 16 - #key do
@@ -219,7 +223,7 @@ function Lock.acquire(self)
         lock_key = self._lock_key,
         timeout = self._timeout,
         expried = self._expried,
-        count = self._count,
+        count = self._max_count,
         rcount = self._reentrant_count,
     })
     if result == nil then
@@ -242,7 +246,7 @@ function Lock.release(self)
         lock_key = self._lock_key,
         timeout = self._timeout,
         expried = self._expried,
-        count = self._count,
+        count = self._max_count,
         rcount = self._reentrant_count,
     })
     if result == nil then
@@ -265,7 +269,7 @@ function Lock.releasetry(self)
         lock_key = self._lock_key,
         timeout = self._timeout,
         expried = self._expried,
-        count = self._count,
+        count = self._max_count,
         rcount = self._reentrant_count,
     })
     return ok, err
@@ -304,7 +308,7 @@ function Lock.update(self)
         lock_key = self._lock_key,
         timeout = self._timeout,
         expried = self._expried,
-        count = self._count,
+        count = self._max_count,
         rcount = self._reentrant_count,
     })
     if result == nil then
@@ -327,7 +331,7 @@ function Lock.releaseHead(self)
         lock_key = self._lock_key,
         timeout = self._timeout,
         expried = self._expried,
-        count = self._count,
+        count = self._max_count,
         rcount = self._reentrant_count,
     })
     if result == nil then
@@ -464,15 +468,26 @@ function Event.waitAndTimeoutRetryClear(self, timeout)
                 self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 0, 0)
             end
 
-            local eok, eerr, eresult = self._event_lock.update()
+            local eok, eerr, eresult = self._event_lock:update()
             if eok and eresult ~= nil and eresult.result == RESULT_SUCCED then
-                self._event_lock.releasetry()
+                self._event_lock:releasetry()
                 return true, "", result
             end
         end
         return false, err, result
     end
-    return self:wait(timeout)
+    
+    timeout = bit.bor(timeout, 0x02000000)
+    self._wait_lock = Lock:new(self._db, self._event_key, timeout, 0, nil, 2, 0)
+    local ok, err, result = self._wait_lock:acquire()
+    if ok then
+        if self._event_lock == nil then
+            self._event_lock = Lock:new(self._db, self._event_key, self._timeout, self._expried, self._event_key, 2, 0)
+        end
+        self._event_lock:releasetry()
+        return true, "", result
+    end
+    return false, err, result
 end
 
 local MaxConcurrentFlow = new_tab(0, 55)
@@ -798,7 +813,13 @@ function Client.command(self, command)
         self._commands_tail = command
     end
     self._commands_waiter:post(1)
-    local ok, err = waiter:wait(command.timeout + 1)
+    local wait_timeout = 1
+    if bit.band(command.timeout, 0x04000000) == 0 then
+        wait_timeout = bit.band(command.timeout, 0xffff) + 1
+    else
+        wait_timeout = bit.band(math.floor(command.timeout / 1000)) + 1
+    end
+    ok, err = waiter:wait(wait_timeout)
     if self._results_waiter[command.request_id] ~= nil then
         self._results_waiter[command.request_id] = waiter
     end
