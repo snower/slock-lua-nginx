@@ -577,6 +577,7 @@ function TokenBucketFlow.acquire(self)
     if not ok and result ~= nil and result.result == RESULT_TIMEOUT then
         self._lock = Lock:new(self._db, self._flow_key, self._timeout, self._period, nil, self._count, 0)
         return self._lock:acquire()
+    end
     return ok, err, result
 end
 
@@ -670,9 +671,6 @@ function Client.reconnect(self)
 end
 
 function Client.close(self) 
-    if _clients[self._name] ~= nil then
-        _clients[self._name] = nil
-    end
     self._closed = true
 
     if self._sock ~= nil then
