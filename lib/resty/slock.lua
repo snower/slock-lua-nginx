@@ -498,10 +498,10 @@ function MaxConcurrentFlow.new(self, db, flow_key, count, timeout, expried, requ
     if count == nil or count >= 0xffff then
         count = 0xffff
     end
-    if expried < 30 and expried % 1 > 0 then
-        expried = bit.bor(math.floor(expried * 1000), 0x04000000)
+    if expried < 1 then
+        expried = bit.bor(math.ceil(expried * 1000), 0x04000000)
     else
-        expried = math.floor(expried)
+        expried = math.ceil(expried)
     end
     local expried_flag = 0x02000000
     if require_aof then
@@ -550,6 +550,7 @@ function TokenBucketFlow.new(self, db, flow_key, count, timeout, period, require
     return setmetatable({
         _db = db,
         _flow_key = flow_key,
+        _count = count or 0xffff,
         _timeout = timeout or 5,
         _period = period or 60,
         _expried_flag = expried_flag,
@@ -560,22 +561,21 @@ end
 function TokenBucketFlow.acquire(self)
     ngx.update_time()
     local expried = 0
-    if self._period <= 1 then
-        local now = ngx.now()
-        expried = bit.bor(math.floor(1000 - ((now % 1) * 1000)), 0x04000000)
-    else
-        local now = ngx.time()
-        if self._period % 60 == 0 then
-            expried = ((math.floor(now / 60) + 1) * 60) % 120 + (60 - (now % 60))
-        else
-            expried = self._period - (now % self._period)
-        end
+    if self._period < 3 then
+        expried = bit.bor(math.ceil(self._period * 1000), self._expried_flag)
+        expried = bit.bor(expried, 0x04000000)
+        self._lock = Lock:new(self._db, self._flow_key, self._timeout, expried, nil, self._count, 0)
+        return self._lock:acquire()
     end
+
+    local now = ngx.time()
+    expried = math.ceil(self._period) - (now % math.ceil(self._period))
     expried = bit.bor(expried, self._expried_flag)
     self._lock = Lock:new(self._db, self._flow_key, 0, expried, nil, self._count, 0)
     local ok, err, result = self._lock:acquire()
     if not ok and result ~= nil and result.result == RESULT_TIMEOUT then
-        self._lock = Lock:new(self._db, self._flow_key, self._timeout, self._period, nil, self._count, 0)
+        expried = bit.bor(math.ceil(self._period), self._expried_flag)
+        self._lock = Lock:new(self._db, self._flow_key, self._timeout, expried, nil, self._count, 0)
         return self._lock:acquire()
     end
     return ok, err, result
