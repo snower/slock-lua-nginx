@@ -94,9 +94,7 @@ local function uint16_to_bin(i)
     if i > 0xffff or i < 0 then
         return nil, 'out max size'
     end
-
-    local ui = math.floor(i / 256)
-    return string.char(i % 256) .. string.char(ui)
+    return string.char(i % 256) .. string.char(bit.rshift(i, 8))
 end
 
 local function bin_to_uint16(b)
@@ -116,13 +114,10 @@ local function uint32_to_bin(i)
     if lbit == nil then
         return nil, msg
     end
-
-    local ui = math.floor(i / 65536)
-    local ubit, msg = uint16_to_bin(ui)
+    local ubit, msg = uint16_to_bin(bit.rshift(i, 16))
     if ubit == nil then
         return nil, msg
     end
-
     return lbit .. ubit
 end
 
@@ -135,7 +130,6 @@ local function bin_to_uint32(b)
     if li == nil then
         return nil, msg
     end
-
     local ui = bin_to_uint16(string.sub(b, 3, 4))
     if ui == nil then
         return nil, msg
@@ -147,7 +141,7 @@ local lock_id_index = 0
 local function gen_lock_id()
     lock_id_index = lock_id_index + 1
     if lock_id_index >= 0xffffffff then
-        lock_id_index = 0
+        lock_id_index = 0 
     end
     return uint32_to_bin(os.time()) .. uint32_to_bin(lock_id_index) .. random_bytes(8)
 end
@@ -187,7 +181,7 @@ end
 local Lock = new_tab(0, 55)
 local _MetaLock = { __index = Lock }
 
-function Lock.new(self, db, lock_key, timeout, expried, lock_id, max_count, reentrant_count) 
+function Lock.new(self, db, lock_key, timeout, expried, lock_id, max_count, reentrant_count)
     lock_key = format_key(lock_key)
     if lock_id == nil or #lock_id == 0 then
         lock_id = gen_lock_id()
@@ -326,6 +320,29 @@ function Lock.releaseHead(self)
         command = COMMAND_TYPE_UNLOCK,
         request_id = gen_request_id(),
         flag = 0x01,
+        db_id = self._db._db_id,
+        lock_id = self._lock_id,
+        lock_key = self._lock_key,
+        timeout = self._timeout,
+        expried = self._expried,
+        count = self._max_count,
+        rcount = self._reentrant_count,
+    })
+    if result == nil then
+        return false, err
+    end
+
+    if result.result ~= 0 then
+        return false, "errcode:" .. result.result, result
+    end
+    return true, "", result
+end
+
+function Lock.releaseHeadRetoLockWait(self)
+    local result, err = self._db._client:command({
+        command = COMMAND_TYPE_UNLOCK,
+        request_id = gen_request_id(),
+        flag = 0x09,
         db_id = self._db._db_id,
         lock_id = self._lock_id,
         lock_key = self._lock_key,
@@ -490,6 +507,114 @@ function Event.waitAndTimeoutRetryClear(self, timeout)
     return false, err, result
 end
 
+
+local GroupEvent = new_tab(0, 55)
+local _MetaGroupEvent = { __index = GroupEvent }
+
+function GroupEvent.new(self, db, group_key, client_id, version_id, timeout, expried)
+    group_key = format_key(group_key)
+
+    return setmetatable({
+        _db = db,
+        _group_key = group_key,
+        _client_id = client_id or 0,
+        _version_id = version_id or 0,
+        _timeout = timeout or 0,
+        _expried = expried or 0,
+        _event_lock = nil,
+        _check_lock = nil,
+        _wait_lock = nil
+    }, _MetaGroupEvent)
+end
+
+function GroupEvent.clear(self)
+    local lock_id = uint32_to_bin(self._version_id) .. '\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff'
+    local timeout = bit.bor(self._timeout, 0x40000000)
+    self._event_lock = Lock:new(self._db, self._group_key, timeout, self._expried, lock_id, 0, 0)
+
+    local ok, err, result = self._event_lock:update()
+    if ok then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function GroupEvent.set(self)
+    local lock_id = '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    self._event_lock = Lock:new(self._db, self._group_key, self._timeout, self._expried, lock_id, 0, 0)
+
+    local ok, err, result = self._event_lock:releaseHead()
+    if ok then
+        return true, "", result
+    end
+    if result ~= nil and result.result == RESULT_UNLOCK_ERROR then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function GroupEvent.isSet(self)
+    self._event_lock = Lock:new(self._db, self._group_key, 0, 0, nil, 0, 0)
+    local ok, err, result = self._event_lock:acquire()
+    if ok then
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function GroupEvent.wakeup(self)
+    local lock_id = '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    local timeout = bit.bor(self._timeout, 0x40000000)
+    self._event_lock = Lock:new(self._db, self._group_key, timeout, self._expried, lock_id, 0, 0)
+
+    local ok, err, result = self._event_lock:releaseHeadRetoLockWait()
+    if ok then
+        if result.lock_id ~= lock_id then
+            self._version_id = bin_to_uint32(result.lock_id)
+        end
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function GroupEvent.wait(self, timeout)
+    local lock_id = uint32_to_bin(self._version_id) .. '\x00\x00\x00\x00' .. uint32_to_bin(self._client_id) .. '\x00\x00\x00\x00'
+    self._wait_lock = Lock:new(self._db, self._group_key, bit.bor(timeout, 0x40000000), 0, lock_id, 0, 0)
+    local ok, err, result = self._wait_lock:acquire()
+    if ok then
+        if result.lock_id ~= lock_id then
+            self._version_id = bin_to_uint32(result.lock_id)
+        end
+        return true, "", result
+    end
+    return false, err, result
+end
+
+function GroupEvent.waitAndTimeoutRetryClear(self, timeout)
+    local lock_id = uint32_to_bin(self._version_id) .. '\x00\x00\x00\x00' .. uint32_to_bin(self._client_id) .. '\x00\x00\x00\x00'
+    self._wait_lock = Lock:new(self._db, self._group_key, bit.bor(timeout, 0x40000000), 0, lock_id, 0, 0)
+    local ok, err, result = self._wait_lock:acquire()
+    if ok then
+        if result.lock_id ~= lock_id then
+            self._version_id = bin_to_uint32(result.lock_id)
+        end
+        return true, "", result
+    end
+
+    if result ~= nil and result.result == RESULT_TIMEOUT then
+        lock_id = uint32_to_bin(self._version_id) .. '\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff'
+        timeout = bit.bor(self._timeout, 0x40000000)
+        self._event_lock = Lock:new(self._db, self._event_key, timeout, self._expried, lock_id, 0, 0)
+
+        local eok, eerr, eresult = self._event_lock:update()
+        if eok and eresult ~= nil and eresult.result == RESULT_SUCCED then
+            self._event_lock:releasetry()
+            return true, "", result
+        end
+    end
+    return false, err, result
+end
+
 local MaxConcurrentFlow = new_tab(0, 55)
 local _MetaMaxConcurrentFlow = { __index = MaxConcurrentFlow }
 
@@ -601,6 +726,10 @@ end
 
 function DataBase.newDefaultClearEvent(self, event_key, timeout, expried)
     return Event:new(self, event_key, timeout, expried, false)
+end
+
+function DataBase.newGroupEvent(self, group_key, client_id, version_id, timeout, expried)
+    return GroupEvent:new(self, group_key, client_id, version_id, timeout, expried)
 end
 
 function DataBase.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
@@ -976,6 +1105,11 @@ function Client.newDefaultClearEvent(self, event_key, timeout, expried)
     return db:newDefaultClearEvent(event_key, timeout, expried)
 end
 
+function Client.newGroupEvent(self, group_key, client_id, version_id, timeout, expried)
+    local db = self:select(0)
+    return db:newGroupEvent(group_key, client_id, version_id, timeout, expried)
+end
+
 function Client.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
     local db = self:select(0)
     return db:newMaxConcurrentFlow(flow_key, count, timeout, expried, require_aof)
@@ -1085,6 +1219,11 @@ end
 function ReplsetClient.newDefaultClearEvent(self, event_key, timeout, expried)
     local db = self:select(0)
     return db:newDefaultClearEvent(event_key, timeout, expried)
+end
+
+function ReplsetClient.newGroupEvent(self, group_key, client_id, version_id, timeout, expried)
+    local db = self:select(0)
+    return db:newGroupEvent(group_key, client_id, version_id, timeout, expried)
 end
 
 function ReplsetClient.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
