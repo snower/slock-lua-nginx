@@ -47,7 +47,7 @@ local RESULT_STATE_ERROR = 10
 local RESULT_ERROR = 11
 
 math.randomseed(os.time())
-function random_bytes(size)
+local function random_bytes(size)
     local b = ''
     for i = 1, size do
         b = b .. string.char(math.random(0, 255))
@@ -58,7 +58,7 @@ end
 local ENCODE_HEXS = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'}
 local DECODE_HEXS = {['0']=0, ['1']=1, ['2']=2, ['3']=3, ['4']=4, ['5']=5, ['6']=6, ['7']=7, ['8']=8, ['9']=9, ['A']=10, ['B']=11, ['C']=12, ['D']=13, ['E']=14, ['F']=15}
 
-function hex_encode(s)
+local function hex_encode(s)
     local es = ''
     for i = 1, #s do
         local b = string.byte(string.sub(s, i, i))
@@ -68,7 +68,7 @@ function hex_encode(s)
     return es
 end
 
-function hex_decode(es)
+local function hex_decode(es)
     if (#es % 2) ~= 0 then
         return nil, 'hex string len error'
     end
@@ -90,7 +90,7 @@ function hex_decode(es)
     return s
 end
 
-function uint16_to_bin(i)
+local function uint16_to_bin(i)
     if i > 0xffff or i < 0 then
         return nil, 'out max size'
     end
@@ -99,7 +99,7 @@ function uint16_to_bin(i)
     return string.char(i % 256) .. string.char(ui)
 end
 
-function bin_to_uint16(b)
+local function bin_to_uint16(b)
     if #b ~= 2 then
         return nil, 'size error'
     end
@@ -107,7 +107,7 @@ function bin_to_uint16(b)
     return string.byte(string.sub(b, 1, 1)) + string.byte(string.sub(b, 2, 2)) * 256
 end
 
-function uint32_to_bin(i)
+local function uint32_to_bin(i)
     if i > 0xffffffff or i < 0 then
         return nil, 'out max size'
     end
@@ -122,11 +122,11 @@ function uint32_to_bin(i)
     if ubit == nil then
         return nil, msg
     end
-    
+
     return lbit .. ubit
 end
 
-function bin_to_uint32(b)
+local function bin_to_uint32(b)
     if #b ~= 4 then
         return nil, 'size error'
     end
@@ -144,7 +144,7 @@ function bin_to_uint32(b)
 end
 
 local lock_id_index = 0
-function gen_lock_id()
+local function gen_lock_id()
     lock_id_index = lock_id_index + 1
     if lock_id_index >= 0xffffffff then
         lock_id_index = 0
@@ -153,7 +153,7 @@ function gen_lock_id()
 end
 
 local request_id_index = 0
-function gen_request_id()
+local function gen_request_id()
     request_id_index = request_id_index + 1
     if request_id_index >= 0xffffffff then
         request_id_index = 0
@@ -161,7 +161,7 @@ function gen_request_id()
     return uint32_to_bin(os.time()) .. uint32_to_bin(request_id_index) .. random_bytes(8)
 end
 
-function format_key(key)
+local function format_key(key)
     if #key == 16 then
         return key
     end
@@ -476,7 +476,7 @@ function Event.waitAndTimeoutRetryClear(self, timeout)
         end
         return false, err, result
     end
-    
+
     timeout = bit.bor(timeout, 0x02000000)
     self._wait_lock = Lock:new(self._db, self._event_key, timeout, 0, nil, 2, 0)
     local ok, err, result = self._wait_lock:acquire()
@@ -493,7 +493,7 @@ end
 local MaxConcurrentFlow = new_tab(0, 55)
 local _MetaMaxConcurrentFlow = { __index = MaxConcurrentFlow }
 
-function MaxConcurrentFlow.new(self, db, flow_key, count, timeout, expried, require_aof) 
+function MaxConcurrentFlow.new(self, db, flow_key, count, timeout, expried, require_aof)
     flow_key = format_key(flow_key)
     if count == nil or count >= 0xffff then
         count = 0xffff
@@ -614,11 +614,11 @@ end
 local Client = new_tab(0, 55)
 local _MetaClient = { __index = Client }
 
-function Client.new(self, name, host, port) 
-    return setmetatable({ 
+function Client.new(self, name, host, port)
+    return setmetatable({
         _name = name,
-        _host = host, 
-        _port = port, 
+        _host = host,
+        _port = port,
         _sock = nil,
         _client_id = gen_lock_id(),
         _dbs = {},
@@ -627,6 +627,7 @@ function Client.new(self, name, host, port)
         _commands_tail = nil,
         _results_waiter = {},
         _results = {},
+        _replset = nil,
         _closed = false
     }, _MetaClient)
 end
@@ -643,13 +644,17 @@ function Client.connect(self)
         ngx.log(ngx.ERR, "slock connect error: " .. err)
         return false, err
     end
-    
+
     self._sock = sock
     local err = self:init()
     if err ~= nil then
         sock:close()
         self._sock = nil
         return false, err
+    end
+
+    if self._replset ~= nil then
+        self._replset:addActiveClient(self)
     end
     return true
 end
@@ -659,7 +664,6 @@ function Client.reconnect(self)
 
     while true
     do
-        ngx.sleep(3)
         if self._closed then
             return
         end
@@ -667,10 +671,11 @@ function Client.reconnect(self)
         if ok then
             return
         end
+        ngx.sleep(3)
     end
 end
 
-function Client.close(self) 
+function Client.close(self)
     self._closed = true
 
     if self._sock ~= nil then
@@ -690,8 +695,8 @@ function Client.close(self)
     end
 end
 
-function Client.init(self) 
-    data = string.char(MAGIC) .. string.char(VERSION) .. string.char(COMMAND_TYPE_INIT) .. gen_request_id() .. self._client_id
+function Client.init(self)
+    local data = string.char(MAGIC) .. string.char(VERSION) .. string.char(COMMAND_TYPE_INIT) .. gen_request_id() .. self._client_id
     for i=1,29,1 do
         data = data .. string.char(0)
     end
@@ -704,7 +709,7 @@ function Client.init(self)
         return err
     end
 
-    local data, err = self._sock:receive(64)
+    data, err = self._sock:receive(64)
     if data == nil then
         return err
     end
@@ -721,8 +726,8 @@ function Client.init(self)
     if string.byte(string.sub(data, 2, 2)) ~= VERSION then
         return 'unknown version'
     end
-    
-    local result = string.byte(string.sub(data, 20, 20))
+
+    result = string.byte(string.sub(data, 20, 20))
     if result ~= 0 then
         return "result error code: " .. hex_encode(string.sub(data, 20, 20))
     end
@@ -751,7 +756,7 @@ function Client.readCommand(self)
     if string.byte(string.sub(data, 2, 2)) ~= VERSION then
         return nil, 'unknown version'
     end
-    
+
     result.command = string.byte(string.sub(data, 3, 3))
     result.request_id = string.sub(data, 4, 19)
     result.result = string.byte(string.sub(data, 20, 20))
@@ -779,7 +784,7 @@ function Client.writeCommand(self, command)
         return 0, 'closed'
     end
 
-    data = string.char(MAGIC) .. string.char(VERSION) .. string.char(command.command) .. command.request_id
+    local data = string.char(MAGIC) .. string.char(VERSION) .. string.char(command.command) .. command.request_id
     if command.command == COMMAND_TYPE_LOCK or command.command == COMMAND_TYPE_UNLOCK then
         data = data .. string.char(command.flag or 0) .. string.char(command.db_id) .. command.lock_id .. command.lock_key
         data = data .. uint32_to_bin(command.timeout or 0) .. uint32_to_bin(command.expried or 0)
@@ -832,7 +837,7 @@ function Client.command(self, command)
         end
         return nil, "unknown result"
     end
-        
+
     command._closed = true
     return nil, err or "timeout"
 end
@@ -854,14 +859,17 @@ function Client.push(self, command)
 end
 
 function Client.processRead(self)
-    while not self._closed 
+    while not self._closed
     do
         local result, err = self:readCommand()
         if result == nil then
             if err == "closed" then
+                if self._replset ~= nil then
+                    self._replset:removeActiveClient(self)
+                end
+
                 if self._closed then
-                    self._commands_waiter:post(1)
-                    return
+                    break
                 end
                 self:reconnect()
             end
@@ -900,47 +908,52 @@ function Client.processRead(self)
         end
     end
     self._results_waiter = {}
+    self._replset = nil
 end
 
 function Client.processWrite(self)
     while not self._closed
     do
+        local command = self._commands_head
+        if command ~= nil then
+            self._commands_head = self._commands_head._next
+            if self._commands_head == nil then
+                self._commands_tail = nil
+            end
+
+            if not command._closed then
+                local n, err = self:writeCommand(command)
+                if err ~= nil then
+                    local waiter = self._results_waiter[command.request_id]
+                    if waiter ~= nil then
+                        local result = {
+                            command = command.command,
+                            request_id = command.request_id,
+                            result = 0x81
+                        }
+                        self._results[command.request_id] = result
+                        self._results_waiter[result.request_id] = nil
+                        waiter:post(1)
+                    end
+                    ngx.log(ngx.ERR, "slock write command error: " .. err)
+                end
+            end
+        end
+
         local ok, err =  self._commands_waiter:wait(86400)
         if not ok then
             if err ~= "timeout" then
                 ngx.log(ngx.ERR, "slock wait command error: " .. err)
-            end
-        else
-            local command = self._commands_head
-            if command ~= nil then
-                self._commands_head = self._commands_head._next
-                if self._commands_head == nil then
-                    self._commands_tail = nil
-                end
-
-                if not command._closed then
-                    local n, err = self:writeCommand(command)
-                    if err ~= nil then
-                        local waiter = self._results_waiter[command.request_id]
-                        if waiter ~= nil then
-                            local result = {
-                                command = command.command,
-                                request_id = command.request_id,
-                                result = 0x81
-                            }
-                            self._results[command.request_id] = result
-                            self._results_waiter[result.request_id] = nil
-                            waiter:post(1)
-                        end
-                        ngx.log(ngx.ERR, "slock write command error: " .. err)
-                    end
-                end
             end
         end
     end
 end
 
 function Client.select(self, db_id)
+    if self._replset ~= nil then
+        return self._replset:select(db_id)
+    end
+
     if self._dbs[db_id] == nil then
         local db = DataBase:new(self, db_id)
         self._dbs[db_id] = db
@@ -976,18 +989,22 @@ end
 local ReplsetClient = new_tab(0, 55)
 local _MetaReplsetClient = { __index = ReplsetClient }
 
-function ReplsetClient.new(self, name, hosts) 
-    return setmetatable({ 
+function ReplsetClient.new(self, name, hosts)
+    return setmetatable({
         _name = name,
-        _hosts = hosts, 
+        _hosts = hosts,
         _clients = {},
+        _activeClients = {},
+        _dbs = {},
         _closed = false
     }, _MetaReplsetClient)
 end
 
-function ReplsetClient.connect(self) 
+function ReplsetClient.connect(self)
     local doConnect = function(index, host, port)
         local c = Client:new(self._name .. index, host, port)
+        c._dbs = self._dbs
+        c._replset = self
         c:connect()
         self._clients[index] = c
 
@@ -1004,79 +1021,91 @@ function ReplsetClient.connect(self)
 end
 
 function ReplsetClient.close(self)
-    self._closed = true 
+    self._closed = true
     for i, client in ipairs(self._clients) do
         client:close()
     end
 end
 
-function ReplsetClient.getClient(self)
-    for i, client in ipairs(self._clients) do
-        if client._sock ~= nil then
-            return client
+function ReplsetClient.addActiveClient(self, client)
+    self._activeClients[#self._activeClients+1] = client
+end
+
+function ReplsetClient.removeActiveClient(self, client)
+    local activeClients = {}
+    for i, c in ipairs(self._activeClients) do
+        if c ~= client then
+            activeClients[#activeClients+1] = c
         end
     end
-    return nil
+    self._activeClients = activeClients
+end
+
+function ReplsetClient.getClient(self)
+    if #self._activeClients > 0 then
+        return self._activeClients[1]
+    end
+    return nil, "all client closed"
+end
+
+function ReplsetClient.command(self, command)
+    local client, err = self:getClient()
+    if client == nil then
+        return nil, err
+    end
+    return client:command(command)
+end
+
+function ReplsetClient.push(self, command)
+    local client, err = self:getClient()
+    if client == nil then
+        return false, err
+    end
+    return client:push(command)
 end
 
 function ReplsetClient.select(self, db_id)
-    local client = self:getClient()
-    if client == nil then
-        return nil, "all client closed"
+    if self._dbs[db_id] == nil then
+        local db = DataBase:new(self, db_id)
+        self._dbs[db_id] = db
     end
-    return client:select(db_id)
+    return self._dbs[db_id]
 end
 
 function ReplsetClient.newLock(self, lock_key, timeout, expried)
-    local client = self:getClient()
-    if client == nil then
-        return nil, "all client closed"
-    end
-    return client:newLock(lock_key, timeout, expried)
+    local db = self:select(0)
+    return db:newLock(lock_key, timeout, expried, '', 0, 0)
 end
 
 function ReplsetClient.newDefaultSetEvent(self, event_key, timeout, expried)
-    local client = self:getClient()
-    if client == nil then
-        return nil, "all client closed"
-    end
-    return client:newDefaultSetEvent(event_key, timeout, expried)
+    local db = self:select(0)
+    return db:newDefaultSetEvent(event_key, timeout, expried)
 end
 
 function ReplsetClient.newDefaultClearEvent(self, event_key, timeout, expried)
-    local client = self:getClient()
-    if client == nil then
-        return nil, "all client closed"
-    end
-    return client:newDefaultClearEvent(event_key, timeout, expried)
+    local db = self:select(0)
+    return db:newDefaultClearEvent(event_key, timeout, expried)
 end
 
 function ReplsetClient.newMaxConcurrentFlow(self, flow_key, count, timeout, expried, require_aof)
-    local client = self:getClient()
-    if client == nil then
-        return nil, "all client closed"
-    end
-    return client:newMaxConcurrentFlow(flow_key, count, timeout, expried, require_aof)
+    local db = self:select(0)
+    return db:newMaxConcurrentFlow(flow_key, count, timeout, expried, require_aof)
 end
 
 function ReplsetClient.newTokenBucketFlow(self, flow_key, count, timeout, period, require_aof)
-    local client = self:getClient()
-    if client == nil then
-        return nil, "all client closed"
-    end
-    return client:newTokenBucketFlow(flow_key, count, timeout, period, require_aof)
+    local db = self:select(0)
+    return db:newTokenBucketFlow(flow_key, count, timeout, period, require_aof)
 end
 
 function _M.connect(self, name, host, port)
     if not _inited then
         self:init()
     end
+    if _clients[name] ~= nil then
+        return nil, "name used"
+    end
 
     local doConnect = function()
-        if _clients[name] ~= nil then
-            return nil, "name used"
-        end
-
         local c = Client:new(name, host, port)
         c:connect()
         _clients[name] = c
@@ -1094,12 +1123,11 @@ function _M.connectReplset(self, name, hosts)
     if not _inited then
         self:init()
     end
+    if _clients[name] ~= nil then
+        return nil, "name used"
+    end
 
     local doConnect = function()
-        if _clients[name] ~= nil then
-            return nil, "name used"
-        end
-
         local c = ReplsetClient:new(name, hosts)
         c:connect()
         _clients[name] = c
