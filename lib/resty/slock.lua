@@ -997,14 +997,13 @@ function Client.processRead(self)
                     self._replset:removeActiveClient(self)
                 end
 
-                if self._closed then
-                    break
+                if not self._closed then
+                    self:reconnect()
                 end
-                self:reconnect()
-            end
-
-            if err ~= "timeout" then
-                ngx.log(ngx.ERR, "slock read command error: " .. err)
+            else
+                if err ~= "timeout" then
+                    ngx.log(ngx.ERR, "slock read command error: " .. err)
+                end
             end
         else
             local waiter = self._results_waiter[result.request_id]
@@ -1041,7 +1040,7 @@ function Client.processRead(self)
 end
 
 function Client.processWrite(self)
-    while not self._closed
+    while not self._closed or self._sock ~= nil
     do
         local command = self._commands_head
         if command ~= nil then
@@ -1135,18 +1134,18 @@ function ReplsetClient.new(self, name, hosts)
 end
 
 function ReplsetClient.connect(self)
-    local doConnect = function(index, host, port)
-        local c = Client:new(self._name .. index, host, port)
-        c._dbs = self._dbs
-        c._replset = self
-        c:connect()
-        self._clients[index] = c
+    local doConnect = function(premature, index, host, port)
+        local client = Client:new(self._name .. "::" .. index, host, port)
+        client._dbs = self._dbs
+        client._replset = self
+        client:connect()
+        self._clients[index] = client
 
         local doProcessWrite = function()
-            c:processWrite()
+            client:processWrite()
         end
         ngx.thread.spawn(doProcessWrite)
-        c:processRead()
+        client:processRead()
     end
 
     for i, host in ipairs(self._hosts) do
@@ -1292,7 +1291,7 @@ function _M.init(self)
                 end
                 return
             end
-            ngx.sleep(0.5)
+            ngx.sleep(2)
         end
     end
     ngx.timer.at(0, check_exiting)
