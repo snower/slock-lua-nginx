@@ -12,6 +12,7 @@ local tostring = tostring
 local rawget = rawget
 local select = select
 local semaphore = require "ngx.semaphore"
+local ngx_re = require "ngx.re"
 
 local ok, new_tab = pcall(require, "table.new")
 if not ok or type(new_tab) ~= "function" then
@@ -570,11 +571,11 @@ function GroupEvent.wakeup(self)
     local ok, err, result = self._event_lock:releaseHeadRetoLockWait()
     if ok then
         if result.lock_id ~= lock_id then
-            self._version_id = bin_to_uint32(result.lock_id)
+            self._version_id = bin_to_uint32(string.sub(result.lock_id, 1, 4))
         end
-        return true, "", result
+        return true, "", self._version_id, result
     end
-    return false, err, result
+    return false, err, "", result
 end
 
 function GroupEvent.wait(self, timeout)
@@ -583,11 +584,11 @@ function GroupEvent.wait(self, timeout)
     local ok, err, result = self._wait_lock:acquire()
     if ok then
         if result.lock_id ~= lock_id then
-            self._version_id = bin_to_uint32(result.lock_id)
+            self._version_id = bin_to_uint32(string.sub(result.lock_id, 1, 4))
         end
-        return true, "", result
+        return true, "", self._version_id, result
     end
-    return false, err, result
+    return false, err, "", result
 end
 
 function GroupEvent.waitAndTimeoutRetryClear(self, timeout)
@@ -596,9 +597,9 @@ function GroupEvent.waitAndTimeoutRetryClear(self, timeout)
     local ok, err, result = self._wait_lock:acquire()
     if ok then
         if result.lock_id ~= lock_id then
-            self._version_id = bin_to_uint32(result.lock_id)
+            self._version_id = bin_to_uint32(string.sub(result.lock_id, 1, 4))
         end
-        return true, "", result
+        return true, "", self._version_id, result
     end
 
     if result ~= nil and result.result == RESULT_TIMEOUT then
@@ -609,10 +610,10 @@ function GroupEvent.waitAndTimeoutRetryClear(self, timeout)
         local eok, eerr, eresult = self._event_lock:update()
         if eok and eresult ~= nil and eresult.result == RESULT_SUCCED then
             self._event_lock:releasetry()
-            return true, "", result
+            return true, "", self._version_id, result
         end
     end
-    return false, err, result
+    return false, err, "", result
 end
 
 local MaxConcurrentFlow = new_tab(0, 55)
@@ -770,7 +771,7 @@ function Client.connect(self)
 
     local ok, err = sock:connect(self._host, self._port)
     if not ok then
-        ngx.log(ngx.ERR, "slock connect error: " .. err)
+        ngx.log(ngx.ERR, "slock connect " .. self._host .. ":" .. self._port .. " error: " .. err)
         return false, err
     end
 
@@ -1258,6 +1259,24 @@ function _M.connect(self, name, host, port)
 end
 
 function _M.connectReplset(self, name, hosts)
+    if type(hosts) == "string" then
+        local hps = ngx_re.split(hosts, ",")
+        hosts = {}
+        for index, value in ipairs(hps) do
+            local hp = ngx_re.split(value, ":")
+            if #hp == 1 then
+                hosts[#hosts+1] = {hp[1], 5658}
+            else
+                if #hp == 2 then
+                    hosts[#hosts+1] = {hp[1], tonumber(hp[2])}
+                end
+            end
+        end
+    end
+    if #hosts == 0 then
+        return nil, "empty hosts"
+    end
+
     if not _inited then
         self:init()
     end
