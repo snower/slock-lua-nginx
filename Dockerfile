@@ -1,14 +1,8 @@
 FROM openresty/openresty
 
 COPY lib/resty/slock.lua /usr/local/openresty/lualib/slock.lua
-COPY conf.d/allow_cross /usr/local/openresty/nginx/conf/
-COPY conf.d/*.conf /etc/nginx/conf.d/
-RUN echo '' >> /usr/local/openresty/nginx/conf/nginx.conf \
-    && echo 'env SLOCK_HOSTS;' >> /usr/local/openresty/nginx/conf/nginx.conf \
-    && echo 'env SLOCK_HOST;' >> /usr/local/openresty/nginx/conf/nginx.conf \
-    && echo 'env SLOCK_PORT;' >> /usr/local/openresty/nginx/conf/nginx.conf \
-    && echo 'env REDIS_HOST;' >> /usr/local/openresty/nginx/conf/nginx.conf \
-    && echo 'env REDIS_PORT;' >> /usr/local/openresty/nginx/conf/nginx.conf \
-    && echo 'env REDIS_DB;' >> /usr/local/openresty/nginx/conf/nginx.conf
+COPY nginx/nginx.conf /usr/local/openresty/nginx/conf/
+COPY nginx/params/*.conf /etc/nginx/
+COPY nginx/conf.d/*.conf /etc/nginx/conf.d/
 
 EXPOSE 80 8080
