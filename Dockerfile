@@ -1,6 +1,7 @@
 FROM openresty/openresty
 
 COPY lib/resty/slock.lua /usr/local/openresty/lualib/slock.lua
+COPY conf.d/allow_cross /usr/local/openresty/nginx/conf/
 COPY conf.d/*.conf /etc/nginx/conf.d/
 RUN echo '' >> /usr/local/openresty/nginx/conf/nginx.conf \
     && echo 'env SLOCK_HOSTS;' >> /usr/local/openresty/nginx/conf/nginx.conf \
